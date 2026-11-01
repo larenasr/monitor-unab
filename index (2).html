@@ -1,0 +1,227 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>UNAB – Monitor MQTT (9 grupos)</title>
+<script src="https://unpkg.com/mqtt@5/dist/mqtt.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4"></script>
+<style>
+  body{font-family:system-ui,Segoe UI,sans-serif;margin:0;background:#f6f7fb;color:#222}
+  header{background:#1f2a44;color:#fff;padding:14px 20px}
+  header h1{margin:0;font-size:18px}
+  .wrap{max-width:1200px;margin:auto;padding:16px}
+  .card{background:#fff;border-radius:10px;box-shadow:0 1px 4px rgba(0,0,0,.08);padding:16px;margin-bottom:16px}
+  .row{display:flex;gap:10px;flex-wrap:wrap;align-items:end}
+  label{font-size:12px;color:#555;display:flex;flex-direction:column;gap:4px}
+  input{padding:7px 9px;border:1px solid #ccc;border-radius:6px;font-size:14px}
+  button{padding:8px 16px;border:0;border-radius:6px;background:#2f6fed;color:#fff;font-size:14px;cursor:pointer}
+  button.sec{background:#888}
+  #estado{font-size:13px;margin-left:auto}
+  .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(190px,1fr));gap:12px;margin-bottom:16px}
+  .g{background:#fff;border-radius:10px;box-shadow:0 1px 4px rgba(0,0,0,.08);padding:12px;border-left:6px solid #ccc}
+  .g h3{margin:0 0 6px;font-size:14px;display:flex;justify-content:space-between}
+  .g .vals{display:flex;gap:10px}
+  .g .v{font-size:22px;font-weight:600}
+  .g .t{font-size:11px;color:#666}
+  .g .ts{font-size:11px;color:#888;margin-top:6px}
+  .g.stale{opacity:.45}
+  .dot{width:9px;height:9px;border-radius:50%;background:#bbb;display:inline-block}
+  .g.live .dot{background:#22c55e}
+  canvas{max-height:320px}
+  #log{font-family:monospace;font-size:12px;max-height:160px;overflow:auto;background:#fafafa;padding:8px;border-radius:6px;white-space:pre}
+</style>
+</head>
+<body>
+<header><h1>UNAB – Sensores en tiempo real (Grupos 1 a 9)</h1></header>
+<div class="wrap">
+
+  <div class="card">
+    <div class="row">
+      <label>Broker (WebSocket seguro)
+        <input id="url" size="34" value="wss://broker.emqx.io:8084/mqtt">
+      </label>
+      <label>Tópico
+        <input id="topic" size="20" value="+/UNAB/Datos">
+      </label>
+      <label>Usuario (opcional)<input id="user" size="10"></label>
+      <label>Clave (opcional)<input id="pass" type="password" size="10"></label>
+      <label>Dividir Temp. por
+        <input id="divT" type="number" value="10" style="width:60px">
+      </label>
+      <label>Dividir Hum. por
+        <input id="divH" type="number" value="10" style="width:60px">
+      </label>
+      <button id="btn">Conectar</button>
+      <button id="sim" class="sec">Simular datos</button>
+      <span id="estado">Desconectado</span>
+    </div>
+  </div>
+
+  <div class="grid" id="grid"></div>
+
+  <div class="card"><canvas id="cT"></canvas></div>
+  <div class="card"><canvas id="cH"></canvas></div>
+
+  <div class="card"><b>Mensajes recibidos</b><div id="log"></div></div>
+</div>
+
+<script>
+const N_GRUPOS = 9;
+const VENTANA_S = 300;      // segundos visibles en los gráficos
+const SIN_DATOS_S = 30;     // tras este tiempo sin mensajes, la tarjeta se atenúa
+const COLORES = ['#e6194b','#3cb44b','#4363d8','#f58231','#911eb4','#42d4f4','#f032e6','#808000','#000075'];
+const t0 = Date.now();
+const ultimo = {};          // grupo -> timestamp del último mensaje
+
+// ---------- Tarjetas por grupo ----------
+const grid = document.getElementById('grid');
+for(let g=1; g<=N_GRUPOS; g++){
+  grid.insertAdjacentHTML('beforeend', `
+    <div class="g stale" id="g${g}" style="border-left-color:${COLORES[g-1]}">
+      <h3>Grupo ${g} <span class="dot"></span></h3>
+      <div class="vals">
+        <div><div class="v" id="t${g}">–</div><div class="t">Temp °C</div></div>
+        <div><div class="v" id="h${g}">–</div><div class="t">Hum %</div></div>
+      </div>
+      <div class="ts" id="ts${g}">sin datos</div>
+    </div>`);
+}
+
+// ---------- Gráficos (una línea por grupo) ----------
+function mkChart(id, titulo){
+  return new Chart(document.getElementById(id), {
+    type:'line',
+    data:{datasets: Array.from({length:N_GRUPOS}, (_,i) => ({
+      label:'G'+(i+1), data:[], borderColor:COLORES[i], backgroundColor:COLORES[i],
+      tension:.3, pointRadius:1, borderWidth:2
+    }))},
+    options:{
+      animation:false, responsive:true, parsing:false,
+      plugins:{title:{display:true,text:titulo}, legend:{position:'bottom'}},
+      scales:{x:{type:'linear', ticks:{maxTicksLimit:8,
+        callback:v => new Date(t0 + v*1000).toLocaleTimeString()}}}
+    }
+  });
+}
+const chT = mkChart('cT','Temperatura (°C)');
+const chH = mkChart('cH','Humedad (%)');
+
+function push(chart, g, y){
+  const x = (Date.now() - t0) / 1000;
+  const ds = chart.data.datasets[g-1].data;
+  ds.push({x, y});
+  while(ds.length && ds[0].x < x - VENTANA_S) ds.shift();
+  chart.options.scales.x.min = Math.max(0, x - VENTANA_S);
+  chart.options.scales.x.max = x;
+  chart.update('none');
+}
+
+// ---------- Interpretación del mensaje ----------
+// Grupo: busca "Grupo<n>" en cualquier parte del tópico (Grupo3/UNAB/Datos, Unab/Grupo3/...)
+function grupoDe(topic){
+  const m = topic.match(/grupo\s*0*(\d+)/i);
+  return m ? parseInt(m[1]) : null;
+}
+// Acepta llaves con nombres distintos: Temperatura, Temp1, tempera, Temoeratura... / Humedad, Hume1, humeda...
+function extraer(topic, payload){
+  let temp = null, hum = null;
+  try{
+    const o = JSON.parse(payload);
+    if(o && typeof o === 'object'){
+      for(const k in o){
+        const n = parseFloat(o[k]); if(isNaN(n)) continue;
+        const kl = k.toLowerCase();
+        if(kl.startsWith('te') && temp === null) temp = n;
+        else if(kl.startsWith('hu') && hum === null) hum = n;
+      }
+    } else if(typeof o === 'number'){
+      // formato antiguo: un número por tópico (.../Temperatura, .../Humedad)
+      const tl = topic.toLowerCase();
+      if(tl.includes('temp')) temp = o; else if(tl.includes('hum')) hum = o;
+    }
+  }catch(e){
+    const n = parseFloat(payload), tl = topic.toLowerCase();
+    if(!isNaN(n)){ if(tl.includes('temp')) temp = n; else if(tl.includes('hum')) hum = n; }
+  }
+  return {temp, hum};
+}
+
+const div = id => { const d = parseFloat(document.getElementById(id).value); return d ? d : 1; };
+
+function procesar(topic, payload){
+  const log = document.getElementById('log');
+  log.textContent = `${new Date().toLocaleTimeString()}  ${topic}  ${payload}\n` + log.textContent.slice(0, 8000);
+
+  const g = grupoDe(topic);
+  if(!g || g < 1 || g > N_GRUPOS) return;
+  const {temp, hum} = extraer(topic, payload);
+
+  if(temp !== null){
+    const x = +(temp / div('divT')).toFixed(1);
+    document.getElementById('t'+g).textContent = x.toFixed(1);
+    push(chT, g, x);
+  }
+  if(hum !== null){
+    const x = +(hum / div('divH')).toFixed(1);
+    document.getElementById('h'+g).textContent = x.toFixed(1);
+    push(chH, g, x);
+  }
+  ultimo[g] = Date.now();
+  document.getElementById('ts'+g).textContent = 'último: ' + new Date().toLocaleTimeString();
+  const card = document.getElementById('g'+g);
+  card.classList.remove('stale'); card.classList.add('live');
+}
+
+// Atenúa grupos que dejaron de enviar
+setInterval(() => {
+  const ahora = Date.now();
+  for(let g=1; g<=N_GRUPOS; g++){
+    if(!ultimo[g] || ahora - ultimo[g] > SIN_DATOS_S*1000){
+      const c = document.getElementById('g'+g); c.classList.add('stale'); c.classList.remove('live');
+    }
+  }
+}, 2000);
+
+// ---------- Conexión MQTT ----------
+let client = null;
+const estado = document.getElementById('estado');
+const btn = document.getElementById('btn');
+btn.onclick = () => {
+  if(client){ client.end(true); client = null; estado.textContent='Desconectado'; btn.textContent='Conectar'; return; }
+  const opts = { clientId:'web_'+Math.random().toString(16).slice(2,10), clean:true, reconnectPeriod:3000, connectTimeout:10000 };
+  const u = document.getElementById('user').value, p = document.getElementById('pass').value;
+  if(u) opts.username = u; if(p) opts.password = p;
+  estado.textContent = 'Conectando…';
+  client = mqtt.connect(document.getElementById('url').value.trim(), opts);
+  client.on('connect', () => {
+    const tp = document.getElementById('topic').value.trim();
+    client.subscribe(tp, {qos:0}, err => {
+      estado.textContent = err ? '🔴 Error al suscribir: ' + err.message : '🟢 Conectado – suscrito a ' + tp;
+    });
+    btn.textContent = 'Desconectar';
+  });
+  client.on('message', (t, m) => procesar(t, m.toString()));
+  client.on('error', e => estado.textContent = '🔴 Error: ' + e.message);
+  client.on('close', () => { if(client) estado.textContent = '🟠 Reconectando…'; });
+};
+
+// Conexión automática al abrir la página
+btn.click();
+
+// ---------- Simulación ----------
+let simTimer = null;
+document.getElementById('sim').onclick = (e) => {
+  if(simTimer){ clearInterval(simTimer); simTimer=null; e.target.textContent='Simular datos'; return; }
+  e.target.textContent = 'Detener simulación';
+  const formatos = [['Temperatura','Humedad'],['Temp1','Hume1'],['tempera','humeda']];
+  simTimer = setInterval(() => {
+    for(let g=1; g<=N_GRUPOS; g++){
+      const [kt,kh] = formatos[g % 3];
+      procesar(`Grupo${g}/UNAB/Datos`, JSON.stringify({[kt]: Math.round(210 + Math.random()*25), [kh]: Math.round(500 + Math.random()*80)}));
+    }
+  }, 1500);
+};
+</script>
+</body>
+</html>
